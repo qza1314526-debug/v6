@@ -22,7 +22,7 @@
 ### 1. 下载并运行脚本
 
 ```bash
-git clone https://github.com/qza666/v6.git
+git clone https://github.com/qza1314526-debug/v6.git
 cd v6
 chmod +x install.sh
 sudo ./install.sh
