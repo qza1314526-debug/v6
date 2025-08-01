@@ -14,6 +14,7 @@ REPO_DIR="v6"
 TUNNEL_NAME="he-ipv6"
 CONFIG_DIR="/etc/he-ipv6"
 CONFIG_FILE="$CONFIG_DIR/$TUNNEL_NAME.conf"
+SERVICE_FILE="/etc/systemd/system/v6.service"
 
 # 初始化安装环境
 init_environment() {
@@ -62,13 +63,12 @@ install_packages() {
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $packages
 }
 
-
 # 安装基本工具
 install_basic_tools() {
     echo "检查并安装必要工具..."
     local base_tools="curl wget"
     local dev_tools="build-essential git"
-    local net_tools="ufw iproute2 net-tools"
+    local net_tools="ufw iproute2 net-tools ip6tables"
     
     # 首先安装基本工具
     if ! command -v curl &>/dev/null || ! command -v wget &>/dev/null; then
@@ -84,7 +84,7 @@ install_basic_tools() {
     install_packages "$net_tools"
     
     # 验证关键工具是否安装成功
-    local required_tools="git curl wget"
+    local required_tools="git curl wget ip6tables"
     for tool in $required_tools; do
         if ! command -v $tool &>/dev/null; then
             echo "错误: $tool 安装失败"
@@ -353,28 +353,74 @@ EOF
     return 0
 }
 
-# 创建系统服务
-create_service() {
-    local ipv6_cidr="$1"
-    local real_ipv4="$2"
+# 配置多IPv4出口
+configure_multi_ipv4() {
+    echo "配置多IPv4出口..."
     
-    cat > /etc/systemd/system/ipv6proxy.service << EOF
+    # 读取IPv6地址
+    source "$CONFIG_FILE"
+    local ipv6_address="${LOCAL_IPV6}"
+    
+    # 询问IPv4数量
+    read -p "请输入要配置的IPv4地址数量 (默认1): " ipv4_count
+    ipv4_count=${ipv4_count:-1}
+    
+    # 收集IPv4地址
+    declare -a ipv4_list=()
+    for ((i=1; i<=$ipv4_count; i++)); do
+        while true; do
+            read -p "请输入IPv4地址 #$i: " ipv4_ip
+            if validate_ipv4 "$ipv4_ip"; then
+                ipv4_list+=("$ipv4_ip")
+                break
+            fi
+            echo "无效的IPv4地址，请重新输入"
+        done
+    done
+    
+    # 生成环境变量配置
+    local env_config="IPV6_ADDRESS=$ipv6_address\nIPV4_COUNT=$ipv4_count\n"
+    for ((i=0; i<${#ipv4_list[@]}; i++)); do
+        env_config+="IPV4_IP$((i+1))=${ipv4_list[$i]}\n"
+    done
+    
+    # 写入服务配置文件
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=IPv6 Proxy Service
+Description=IPv6 to IPv4 Proxy Service
 After=network.target
 
 [Service]
-ExecStart=/usr/local/go/bin/go run /root/v6/cmd/ipv6proxy/main.go -cidr "$ipv6_cidr" -random-ipv6-port 100 -real-ipv4-port 101 -real-ipv4 "$real_ipv4"
+Type=simple
+EnvironmentFile=/etc/default/v6
+ExecStart=/usr/local/bin/v6 start
+ExecStop=/usr/local/bin/v6 stop
 Restart=always
-User=root
-WorkingDirectory=/root/v6
-Environment=PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 [Install]
 WantedBy=multi-user.target
 EOF
+    
+    # 写入环境变量文件
+    echo -e "$env_config" > /etc/default/v6
+    
+    echo "多IPv4出口配置完成"
+}
 
-    systemctl daemon-reload
+# 编译并安装程序
+build_and_install() {
+    echo "编译并安装程序..."
+    
+    cd "$REPO_DIR"
+    go build -o v6 main.go || {
+        echo "编译失败"
+        exit 1
+    }
+    
+    cp v6 /usr/local/bin/v6
+    chmod +x /usr/local/bin/v6
+    
+    echo "程序安装完成"
 }
 
 # 主函数
@@ -386,20 +432,16 @@ main() {
     check_root
     check_network
     
-    # 先安装基本工具，不再并行执行
+    # 安装基本工具
     install_basic_tools
     
-    # 安装Go（可以在工具安装完成后并行执行）
-    install_go &
-    go_pid=$!
+    # 安装Go
+    install_go
     
-    # 克隆代码（工具已经安装完成，可以安全执行）
+    # 克隆代码
     clone_or_update_repo
     
-    # 等待Go安装完成
-    wait $go_pid
-    
-    # 继续其他配置
+    # 检查系统内存
     check_system_memory
     optimize_system_config
     
@@ -408,76 +450,52 @@ main() {
         echo "隧道配置失败"
         exit 1
     fi
-    # 从配置文件读取信息
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        ipv6_cidr="${ROUTED_PREFIX}/${PREFIX_LENGTH}"
-        real_ipv4="${LOCAL_IPV4}"
-    else
-        echo "错误：找不到隧道配置文件"
-        exit 1
-    fi
     
-    # 创建并启动服务
-    create_service "$ipv6_cidr" "$real_ipv4"
+    # 配置多IPv4出口
+    configure_multi_ipv4
+    
+    # 编译并安装程序
+    build_and_install
+    
+    # 启用并启动服务
+    systemctl daemon-reload
+    systemctl enable v6
+    systemctl start v6
     
     # 显示完成信息
     echo -e "\n安装完成！使用说明："
     cat << EOF
 
 IPv6代理服务已配置完成。服务详情：
-- 随机IPv6代理端口：100
-- 真实IPv4代理端口：101
-- IPv6 CIDR：$ipv6_cidr
-- 真实IPv4地址：$real_ipv4
+- IPv6地址: $(source /etc/default/v6; echo $IPV6_ADDRESS)
+- IPv4出口数量: $(source /etc/default/v6; echo $IPV4_COUNT)
 
 管理命令：
 1. 启动服务：
-   systemctl start ipv6proxy
+   systemctl start v6
 
-2. 设置开机自启：
-   systemctl enable ipv6proxy
+2. 停止服务：
+   systemctl stop v6
 
-3. 查看服务状态：
-   systemctl status ipv6proxy
+3. 重启服务：
+   systemctl restart v6
 
-4. 查看服务日志：
-   journalctl -u ipv6proxy -f
+4. 查看服务状态：
+   systemctl status v6
 
-5. 停止服务：
-   systemctl stop ipv6proxy
-
-5. 手动测试：
-   cd /root/v6
-   go run cmd/ipv6proxy/main.go -cidr $ipv6_cidr -real-ipv4 $real_ipv4
+5. 查看服务日志：
+   journalctl -u v6 -f
 
 配置文件位置：
 - 隧道配置：$CONFIG_FILE
-- 服务配置：/etc/systemd/system/ipv6proxy.service
+- IPv4配置：/etc/default/v6
+- 服务配置：$SERVICE_FILE
 
-如需修改配置，编辑相应文件后请运行：
-systemctl daemon-reload
-systemctl restart ipv6proxy
+如需修改IPv4配置，请编辑/etc/default/v6后运行：
+systemctl restart v6
 
 EOF
 
-    # 询问是否启动服务
-    read -p "是否现在启动服务？(y/n): " start_service
-    if [[ $start_service == [yY] ]]; then
-        echo "正在启动服务..."
-        systemctl start ipv6proxy
-        sleep 2
-        if systemctl is-active ipv6proxy >/dev/null 2>&1; then
-            echo "服务已成功启动"
-            systemctl status ipv6proxy
-        else
-            echo "服务启动失败，请检查日志："
-            journalctl -u ipv6proxy -n 50 --no-pager
-        fi
-    fi
-
-    echo -e "\n安装和配置已完成。请检查上述信息，确保所有配置正确。"
-    echo "如有任何问题，请查看系统日志或联系支持。"
     echo "安装日志保存在：$LOG_FILE"
 }
 
